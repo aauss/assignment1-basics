@@ -21,30 +21,19 @@ except ImportError:
 app = typer.Typer()
 
 SymbolSeq: TypeAlias = tuple[bytes, ...]
-SymbolSeqCounts: TypeAlias = Counter[SymbolSeq]
+SymbolSeqCounts: TypeAlias = dict[SymbolSeq, int]
 BytePair: TypeAlias = tuple[bytes, bytes]
 BytePairCounts: TypeAlias = dict[BytePair, int]
 
 NUM_PROCESSES = cpu_count() - 1
-NUM_BASE_BYTES = 256  # Single-byte tokens (0x00-0xFF)
-
-
-class Pretokenizer:
-    def __init__(self):
-        self.PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
-        self.BYTE_CACHE = {i: bytes([i]) for i in range(NUM_BASE_BYTES)}
-
-    def __call__(self, doc: str) -> dict[SymbolSeq, int]:
-        pre_tokenized_dict = defaultdict(int)
-        for token in re.finditer(self.PAT, doc):
-            key = tuple(self.BYTE_CACHE[b] for b in token[0].encode("utf-8"))
-            pre_tokenized_dict[key] += 1
-        return pre_tokenized_dict
+NUM_BASE_BYTES = 256
 
 
 class ParallelPretokenizer:
     def __init__(self):
-        self.pretokenizer = Pretokenizer()
+        self.PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+        self.BYTE_CACHE = {i: bytes([i]) for i in range(NUM_BASE_BYTES)}
+        self._key_cache: dict[str, SymbolSeq] = {}
 
     def __call__(self, chunks: list[str]) -> SymbolSeqCounts:
         pretokenised_chunks = self._parallel_pretokenise_chunks(chunks)
@@ -54,26 +43,37 @@ class ParallelPretokenizer:
         self,
         pretokenised_chunks: Iterator[SymbolSeqCounts],
     ) -> SymbolSeqCounts:
-        merged = Counter()
-        for chunk_dicts in tqdm(pretokenised_chunks, desc="Merging pretokenized docs"):
-            merged.update(chunk_dicts)
+        merged = defaultdict(int)
+        for chunk_dicts in pretokenised_chunks:
+            for seq, freq in chunk_dicts.items():
+                merged[seq] += freq
         return merged
 
-    def _parallel_pretokenise_chunks(self, chunks: list[str]) -> Iterator[list[dict[SymbolSeq, int]]]:
+    def _parallel_pretokenise_chunks(self, chunks: list[str]) -> Iterator[dict[SymbolSeq, int]]:
+        if NUM_PROCESSES <= 1:
+            yield from (self._pretokenise_chunks(chunk) for chunk in chunks)
+            return
         with Pool(NUM_PROCESSES) as p:
             yield from tqdm(
-                p.imap_unordered(self._pretokenise_chunks, chunks, chunksize=max(1, (len(chunks) // NUM_PROCESSES))),
+                p.imap_unordered(self._pretokenise_chunks, chunks, chunksize=1),
                 total=len(chunks),
-                desc="Pretokenising chunks",
+                desc="Pretokenizing chunks",
             )
 
     def _pretokenise_chunks(self, chunk: str) -> SymbolSeqCounts:
-        docs = [d for d in chunk.split("<|endoftext|>") if len(d) > 0]
-        tokenized_docs = [self.pretokenizer(d) for d in docs]
-        merged = Counter()
-        for doc_counts in tokenized_docs:
-            merged.update(doc_counts)
-        return merged
+        str_counts: Counter[str] = Counter()
+        for doc in chunk.split("<|endoftext|>"):
+            if doc:
+                str_counts.update(self.PAT.findall(doc))
+        result: SymbolSeqCounts = {}
+        for token, count in str_counts.items():
+            key = self._key_cache.get(token)
+            if key is None:
+                # Avoid redunandt conversion to bytes
+                key = tuple(self.BYTE_CACHE[b] for b in token.encode("utf-8"))
+                self._key_cache[token] = key
+            result[key] = count
+        return result
 
 
 @dataclass(frozen=True)
@@ -128,7 +128,7 @@ class BPETrainer:
     def _read_input_in_chunks(self, input_path: str | os.PathLike) -> list[str]:
         chunks = []
         with open(input_path, "rb") as f:
-            boundaries = find_chunk_boundaries(f, NUM_PROCESSES, b"<|endoftext|>")
+            boundaries = find_chunk_boundaries(f, NUM_PROCESSES * 2, b"<|endoftext|>")
             for start, end in zip(boundaries[:-1], boundaries[1:]):
                 f.seek(start)
                 chunk = f.read(end - start).decode("utf-8", errors="ignore")
@@ -142,10 +142,10 @@ class BPETrainer:
                 bytepair2seqs[pair].add(symbol_seq)
         return bytepair2seqs
 
-    def _symbol_seqs_to_bytepairs(self) -> dict[SymbolSeq, Counter[BytePair]]:
-        seq2bytepair = {}
+    def _symbol_seqs_to_bytepairs(self) -> dict[SymbolSeq, BytePairCounts]:
+        seq2bytepair: dict[SymbolSeq, BytePairCounts] = {}
         for symbol_seq, freq in self.symbol_seq_counts.items():
-            pair_counts = Counter()
+            pair_counts: BytePairCounts = defaultdict(int)
             for pair in pairwise(symbol_seq):
                 pair_counts[pair] += freq
             seq2bytepair[symbol_seq] = pair_counts
@@ -180,10 +180,11 @@ class BPETrainer:
                 return heap_item.pair
         raise ValueError("No most frequent bytepair found")
 
-    def _find_bytepairs_to_remove(self, seqs_to_merge: list[SymbolSeq]) -> Counter[BytePair]:
-        old_bytepairs_to_remove = Counter()
+    def _find_bytepairs_to_remove(self, seqs_to_merge: list[SymbolSeq]) -> dict[BytePair, int]:
+        old_bytepairs_to_remove = defaultdict(int)
         for seq in seqs_to_merge:
-            old_bytepairs_to_remove += self.seq2bytepair[seq]
+            for pair, freq in self.seq2bytepair[seq].items():
+                old_bytepairs_to_remove[pair] += freq
         return old_bytepairs_to_remove
 
     def _merge_bytepairs_in_seqs(self, seqs_to_merge: list[SymbolSeq], best_pair: BytePair) -> list[SymbolSeq]:
@@ -197,9 +198,10 @@ class BPETrainer:
 
     def _merge_in_new_symbol_seq(self, symbol_seq: SymbolSeq, to_merge: BytePair) -> SymbolSeq:
         out, i = [], 0
+        merged_symbol = to_merge[0] + to_merge[1]
         while i < len(symbol_seq):
             if (i + 1 < len(symbol_seq)) and ((symbol_seq[i], symbol_seq[i + 1]) == to_merge):
-                out.append(b"".join(to_merge))
+                out.append(merged_symbol)
                 i += 2
             else:
                 out.append(symbol_seq[i])
@@ -210,11 +212,12 @@ class BPETrainer:
 
     def _update_mappings_and_count_new_bytepairs(
         self, new2old_seqs: Iterable[tuple[SymbolSeq, SymbolSeq]]
-    ) -> Counter[BytePair]:
-        new_bytepair_counts = Counter()
+    ) -> BytePairCounts:
+        new_bytepair_counts = defaultdict(int)
         for new_seq, old_seq in new2old_seqs:
             seq_bytepairs = self._to_bytepair_counts({new_seq: self.symbol_seq_counts[new_seq]})
-            new_bytepair_counts += Counter(seq_bytepairs)
+            for pair, freq in seq_bytepairs.items():
+                new_bytepair_counts[pair] += freq
             del self.seq2bytepair[old_seq]
             self.seq2bytepair[new_seq] = seq_bytepairs
             for bp in seq_bytepairs:
@@ -222,7 +225,7 @@ class BPETrainer:
         return new_bytepair_counts
 
     def _update_bytepair_counts(
-        self, old_bytepairs_to_remove: Counter[BytePair], new_bytepair_counts: Counter[BytePair]
+        self, old_bytepairs_to_remove: dict[BytePair, int], new_bytepair_counts: BytePairCounts
     ) -> None:
         for pair, freq in old_bytepairs_to_remove.items():
             self.bytepair_counts[pair] -= freq
@@ -237,12 +240,14 @@ class BPETrainer:
             else:
                 heapq.heappush(self.heap, HeapItem(-count, pair))
 
-    def _update_bytepair2seqs(self, seqs_to_merge: list[SymbolSeq], old_bytepairs_to_remove: Counter[BytePair]) -> None:
+    def _update_bytepair2seqs(
+        self, seqs_to_merge: list[SymbolSeq], old_bytepairs_to_remove: dict[BytePair, int]
+    ) -> None:
+        seqs_to_remove = set(seqs_to_merge)
         for old_bytepair in old_bytepairs_to_remove:
             seqs = self.bytepair2seqs.get(old_bytepair)
-            if seqs is None:
-                continue
-            seqs.difference_update(seqs_to_merge)
+            overlap = seqs & seqs_to_remove
+            seqs.difference_update(overlap)
             if not seqs:
                 del self.bytepair2seqs[old_bytepair]
 
