@@ -1,7 +1,9 @@
+import heapq
 import os
 import pickle
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from itertools import pairwise
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
@@ -50,25 +52,39 @@ class ParallelPretokenizer:
 
     def _merge_pretokenised_chunks(
         self,
-        pretokenised_chunks: Iterator[list[dict[SymbolSeq, int]]],
+        pretokenised_chunks: Iterator[SymbolSeqCounts],
     ) -> SymbolSeqCounts:
         merged = Counter()
         for chunk_dicts in tqdm(pretokenised_chunks, desc="Merging pretokenized docs"):
-            for doc_counts in chunk_dicts:
-                merged.update(doc_counts)
+            merged.update(chunk_dicts)
         return merged
 
     def _parallel_pretokenise_chunks(self, chunks: list[str]) -> Iterator[list[dict[SymbolSeq, int]]]:
         with Pool(NUM_PROCESSES) as p:
             yield from tqdm(
-                p.imap_unordered(self._pretokenise_chunks, chunks, chunksize=1),
+                p.imap_unordered(self._pretokenise_chunks, chunks, chunksize=max(1, (len(chunks) // NUM_PROCESSES))),
                 total=len(chunks),
                 desc="Pretokenising chunks",
             )
 
-    def _pretokenise_chunks(self, chunk: str) -> list[dict[SymbolSeq, int]]:
+    def _pretokenise_chunks(self, chunk: str) -> SymbolSeqCounts:
         docs = [d for d in chunk.split("<|endoftext|>") if len(d) > 0]
-        return [self.pretokenizer(d) for d in docs]
+        tokenized_docs = [self.pretokenizer(d) for d in docs]
+        merged = Counter()
+        for doc_counts in tokenized_docs:
+            merged.update(doc_counts)
+        return merged
+
+
+@dataclass(frozen=True)
+class HeapItem:
+    neg_freq: int
+    pair: tuple[bytes, bytes]
+
+    def __lt__(self, other: "HeapItem") -> bool:
+        if self.neg_freq != other.neg_freq:
+            return self.neg_freq < other.neg_freq
+        return self.pair > other.pair
 
 
 class BPETrainer:
@@ -89,6 +105,8 @@ class BPETrainer:
         self.bytepair2seqs = self._bytepairs_to_symbol_seqs()
         self.seq2bytepair = self._symbol_seqs_to_bytepairs()
         self.bytepair_counts = self._to_bytepair_counts(self.symbol_seq_counts)
+        self.heap = [HeapItem(-freq, bp) for bp, freq in self.bytepair_counts.items()]
+        heapq.heapify(self.heap)
 
         merges = []
         for _ in tqdm(range(vocab_size - NUM_BASE_BYTES - len(special_tokens)), desc="Merging bytepairs"):
@@ -155,8 +173,12 @@ class BPETrainer:
         return best_pair
 
     def _most_frequent_bytepair(self) -> BytePair:
-        # One pass: maximize frequency first, then lexicographic byte-pair order.
-        return max(self.bytepair_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        while self.heap:
+            heap_item = heapq.heappop(self.heap)
+            current_freq = self.bytepair_counts.get(heap_item.pair, 0)
+            if current_freq == -heap_item.neg_freq:
+                return heap_item.pair
+        raise ValueError("No most frequent bytepair found")
 
     def _find_bytepairs_to_remove(self, seqs_to_merge: list[SymbolSeq]) -> Counter[BytePair]:
         old_bytepairs_to_remove = Counter()
@@ -209,8 +231,11 @@ class BPETrainer:
 
         touched = set(old_bytepairs_to_remove) | set(new_bytepair_counts)
         for pair in touched:
-            if self.bytepair_counts.get(pair) == 0:
+            count = self.bytepair_counts.get(pair)
+            if count == 0:
                 del self.bytepair_counts[pair]
+            else:
+                heapq.heappush(self.heap, HeapItem(-count, pair))
 
     def _update_bytepair2seqs(self, seqs_to_merge: list[SymbolSeq], old_bytepairs_to_remove: Counter[BytePair]) -> None:
         for old_bytepair in old_bytepairs_to_remove:
